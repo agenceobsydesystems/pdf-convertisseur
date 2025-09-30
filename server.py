@@ -12,6 +12,7 @@ from functools import wraps
 import mimetypes
 import unicodedata
 import re
+import json
 import requests  # AJOUT pour télécharger depuis URL
 
 app = Flask(__name__)
@@ -25,7 +26,19 @@ FILE_EXPIRY_HOURS = int(os.environ.get('FILE_EXPIRY_HOURS', 24))
 BASE_URL = os.environ.get('BASE_URL', 'https://pdf-converter-server-production.up.railway.app')
 
 # Stockage temporaire en mémoire
-TEMP_STORAGE = {}
+DATA_DIR = '/data/files'
+METADATA_FILE = '/data/metadata.json'
+os.makedirs(DATA_DIR, exist_ok=True)
+
+def load_metadata():
+    if os.path.exists(METADATA_FILE):
+        with open(METADATA_FILE, 'r') as f:
+            return json.load(f)
+    return {}
+
+def save_metadata(metadata):
+    with open(METADATA_FILE, 'w') as f:
+        json.dump(metadata, f, indent=2)
 
 # Tous les formats acceptés
 ALLOWED_EXTENSIONS = {
@@ -72,17 +85,17 @@ def sanitize_filename(filename):
     return name
 
 def cleanup_old_files():
-    """Nettoie les fichiers expirés"""
-    current_time = datetime.now()
-    expired_keys = []
-    
-    for key, data in TEMP_STORAGE.items():
-        if current_time > data['expiry']:
-            expired_keys.append(key)
-    
-    for key in expired_keys:
-        del TEMP_STORAGE[key]
-        print(f"[DELETE] Fichier expire supprime: {key}")
+    metadata = load_metadata()
+    expired = []
+    for file_id, data in metadata.items():
+        if datetime.now() > datetime.fromisoformat(data['expiry']):
+            expired.append(file_id)
+            if os.path.exists(data['file_path']):
+                os.remove(data['file_path'])
+    for key in expired:
+        del metadata[key]
+    if expired:
+        save_metadata(metadata)
 
 def require_api_key(f):
     """Vérification des clés API"""
@@ -105,31 +118,27 @@ def require_api_key(f):
     return decorated_function
 
 def store_file(content, filename, content_type=None):
-    """Stocke n'importe quel fichier et retourne une URL"""
     cleanup_old_files()
-    
     file_id = str(uuid.uuid4())
-    expiry = datetime.now() + timedelta(hours=FILE_EXPIRY_HOURS)
-    
-    # NETTOYER LE NOM DU FICHIER
     clean_filename = sanitize_filename(filename)
-    print(f"[INFO] Nom original: {filename}")
-    print(f"[INFO] Nom nettoye: {clean_filename}")
-    
-    # Détecter le type MIME
     if not content_type:
         content_type = mimetypes.guess_type(clean_filename)[0] or 'application/octet-stream'
     
-    TEMP_STORAGE[file_id] = {
-        'content': base64.b64encode(content).decode('utf-8') if isinstance(content, bytes) else content,
-        'filename': clean_filename,  # Utiliser le nom nettoyé
-        'original_filename': filename,  # Garder le nom original pour info
-        'content_type': content_type,
-        'expiry': expiry,
-        'created': datetime.now(),
-        'size': len(content)
-    }
+    file_path = os.path.join(DATA_DIR, f"{file_id}_{clean_filename}")
+    with open(file_path, 'wb') as f:
+        f.write(content if isinstance(content, bytes) else content.encode())
     
+    metadata = load_metadata()
+    metadata[file_id] = {
+        'filename': clean_filename,
+        'original_filename': filename,
+        'content_type': content_type,
+        'expiry': (datetime.now() + timedelta(hours=FILE_EXPIRY_HOURS)).isoformat(),
+        'created': datetime.now().isoformat(),
+        'size': len(content),
+        'file_path': file_path
+    }
+    save_metadata(metadata)
     return f"{BASE_URL}/download/{file_id}"
 
 def get_file_extension(filename):
@@ -368,36 +377,36 @@ def upload_from_url():
 
 @app.route('/download/<file_id>')
 def download(file_id):
-    """Télécharge un fichier stocké"""
     cleanup_old_files()
+    metadata = load_metadata()
     
-    if file_id not in TEMP_STORAGE:
+    if file_id not in metadata:
         return jsonify({"error": "Fichier non trouvé ou expiré"}), 404
     
-    file_data = TEMP_STORAGE[file_id]
+    file_data = metadata[file_id]
     
-    # Vérifier l'expiration
-    if datetime.now() > file_data['expiry']:
-        del TEMP_STORAGE[file_id]
+    if datetime.now() > datetime.fromisoformat(file_data['expiry']):
+        if os.path.exists(file_data['file_path']):
+            os.remove(file_data['file_path'])
+        del metadata[file_id]
+        save_metadata(metadata)
         return jsonify({"error": "Fichier expiré"}), 404
     
-    # Décoder le contenu
-    content = base64.b64decode(file_data['content'])
+    if not os.path.exists(file_data['file_path']):
+        return jsonify({"error": "Fichier physique non trouvé"}), 404
     
-    # Créer la réponse avec le bon type MIME
-    response = Response(
+    with open(file_data['file_path'], 'rb') as f:
+        content = f.read()
+    
+    return Response(
         content,
         mimetype=file_data['content_type'],
         headers={
             'Content-Disposition': f'attachment; filename="{file_data["filename"]}"',
-            'Content-Length': str(len(content)),
-            'Content-Type': file_data['content_type'],
-            'Cache-Control': 'public, max-age=3600'
+            'Content-Type': file_data['content_type']
         }
     )
     
-    return response
-
 @app.route('/info/<file_id>')
 def file_info(file_id):
     """Retourne les infos sur un fichier"""
